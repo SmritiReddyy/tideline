@@ -1,0 +1,49 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "tideline"
+version = "0.1.0"
+description = "CDC streaming lakehouse: Postgres -> Debezium -> Kafka -> Spark -> Delta Lake"
+readme = "README.md"
+# Spark 3.5 does not support Python 3.12+ workers reliably; 3.10/3.11 are the
+# supported pair for this stack.
+requires-python = ">=3.10,<3.12"
+dependencies = [
+    "pyspark==3.5.3",
+    "delta-spark==3.2.1",
+    "psycopg[binary]>=3.2",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "ruff>=0.6",
+    "duckdb>=1.1",
+    # DuckDB needs pytz to hand TIMESTAMP WITH TIME ZONE values back to Python,
+    # which every Debezium-sourced timestamp column is.
+    "pytz>=2024.1",
+]
+
+[project.scripts]
+tideline = "tideline.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["tideline"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+# Spark logs a lot; keep test output readable.
+filterwarnings = ["ignore::DeprecationWarning"]

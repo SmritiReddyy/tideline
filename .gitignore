@@ -1,0 +1,41 @@
+# --- lakehouse ------------------------------------------------------------
+# Delta tables, checkpoints and benchmark output are all regenerable.
+data/
+
+# --- spark ----------------------------------------------------------------
+spark-warehouse/
+metastore_db/
+derby.log
+*.crc
+.spark-history/
+
+# --- python ---------------------------------------------------------------
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# --- airflow --------------------------------------------------------------
+airflow/logs/
+airflow.db
+airflow.cfg
+webserver_config.py
+
+# --- credentials ----------------------------------------------------------
+.env
+.env.*
+!.env.example
+
+# --- editors / os ---------------------------------------------------------
+.DS_Store
+.idea/
+.vscode/
+*.swp
