@@ -1,0 +1,191 @@
+# Tideline CDC stack.
+#
+# Redpanda instead of Kafka + ZooKeeper (or Kafka + KRaft): one Go binary, no
+# JVM, no coordination service, and it speaks the Kafka protocol so Debezium
+# and Spark are unmodified. On an 8 GB laptop that difference is what makes the
+# stack runnable alongside Spark at all — the equivalent Kafka setup wants
+# ~3 GB before a single message is produced.
+#
+#   docker compose up -d
+#   docker compose --profile query up -d     # add Trino
+#   docker compose down -v
+#
+# Memory budget, roughly: postgres 256M + redpanda 1G + connect 1G = 2.3 G,
+# leaving room for a 2 G Spark driver on the host.
+
+name: tideline
+
+services:
+  # ------------------------------------------------------------- source DB
+  postgres:
+    image: postgres:16-alpine
+    container_name: tideline-postgres
+    environment:
+      POSTGRES_DB: tideline
+      POSTGRES_USER: tideline
+      POSTGRES_PASSWORD: tideline
+    command:
+      # wal_level=logical is the switch that makes CDC possible at all —
+      # without it the WAL carries only physical page changes, which cannot be
+      # decoded back into rows.
+      - postgres
+      - -c
+      - wal_level=logical
+      - -c
+      - max_wal_senders=4
+      - -c
+      - max_replication_slots=4
+      # A replication slot holds WAL until its consumer acknowledges it. If
+      # Debezium stops, the disk fills. This caps the damage.
+      - -c
+      - max_slot_wal_keep_size=1GB
+      - -c
+      - shared_buffers=128MB
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ./postgres/init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U tideline -d tideline"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+
+  # ------------------------------------------------- streaming backbone
+  redpanda:
+    image: redpandadata/redpanda:v24.2.7
+    container_name: tideline-redpanda
+    command:
+      - redpanda
+      - start
+      # `--overprovisioned` and an explicit memory cap stop Redpanda assuming
+      # it owns the machine — its default is to reserve most of available RAM.
+      - --overprovisioned
+      - --smp=1
+      - --memory=1G
+      - --reserve-memory=0M
+      - --node-id=0
+      - --check=false
+      # Two listeners: `internal` for containers, `external` for the host, so
+      # Spark on the host and Connect in Docker both resolve the broker.
+      - --kafka-addr=internal://0.0.0.0:9092,external://0.0.0.0:19092
+      - --advertise-kafka-addr=internal://redpanda:9092,external://localhost:19092
+      - --pandaproxy-addr=internal://0.0.0.0:8082,external://0.0.0.0:18082
+      - --advertise-pandaproxy-addr=internal://redpanda:8082,external://localhost:18082
+    ports:
+      - "19092:19092"
+      - "18082:18082"
+      - "9644:9644"
+    volumes:
+      - redpanda-data:/var/lib/redpanda/data
+    healthcheck:
+      test: ["CMD-SHELL", "rpk cluster health | grep -q 'Healthy:.*true'"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 20s
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 1500M
+
+  console:
+    image: redpandadata/console:v2.7.2
+    container_name: tideline-console
+    environment:
+      KAFKA_BROKERS: redpanda:9092
+      CONNECT_ENABLED: "true"
+      CONNECT_CLUSTERS_NAME: debezium
+      CONNECT_CLUSTERS_URL: http://connect:8083
+    ports:
+      - "8085:8080"
+    depends_on:
+      redpanda:
+        condition: service_healthy
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+
+  # -------------------------------------------------------------- Debezium
+  connect:
+    image: debezium/connect:2.7.3.Final
+    container_name: tideline-connect
+    environment:
+      BOOTSTRAP_SERVERS: redpanda:9092
+      GROUP_ID: tideline-connect
+      CONFIG_STORAGE_TOPIC: _connect_configs
+      OFFSET_STORAGE_TOPIC: _connect_offsets
+      STATUS_STORAGE_TOPIC: _connect_status
+      # Single-node stack, so the internal topics cannot be replicated.
+      CONFIG_STORAGE_REPLICATION_FACTOR: 1
+      OFFSET_STORAGE_REPLICATION_FACTOR: 1
+      STATUS_STORAGE_REPLICATION_FACTOR: 1
+      # Plain JSON without embedded schemas. Avro plus a schema registry is the
+      # better production choice; JSON keeps this stack to four containers and
+      # makes the envelope readable in the console while learning it.
+      KEY_CONVERTER: org.apache.kafka.connect.json.JsonConverter
+      VALUE_CONVERTER: org.apache.kafka.connect.json.JsonConverter
+      CONNECT_KEY_CONVERTER_SCHEMAS_ENABLE: "false"
+      CONNECT_VALUE_CONVERTER_SCHEMAS_ENABLE: "false"
+      KAFKA_HEAP_OPTS: "-Xms256M -Xmx768M"
+    ports:
+      - "8083:8083"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redpanda:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:8083/connectors || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 18
+      start_period: 30s
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 1G
+
+  # ----------------------------------------------------------- query layer
+  # Opt-in: `docker compose --profile query up -d`. Trino is another JVM and is
+  # not needed for the pipeline itself — DuckDB reads the same Delta tables
+  # locally for most exploration.
+  trino:
+    image: trinodb/trino:468
+    container_name: tideline-trino
+    profiles: ["query"]
+    ports:
+      - "8086:8080"
+    volumes:
+      - ../query/trino/catalog:/etc/trino/catalog:ro
+      # Replaces the image default to enable the local filesystem — see the
+      # comment at the top of that file for why it cannot live in the catalog.
+      - ../query/trino/config.properties:/etc/trino/config.properties:ro
+      - ../data/lakehouse:/data/lakehouse
+    environment:
+      JAVA_TOOL_OPTIONS: "-Xmx1500m"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:8080/v1/info | grep -q '\"starting\":false'"]
+      interval: 10s
+      timeout: 5s
+      retries: 18
+      start_period: 30s
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 2G
+
+volumes:
+  postgres-data:
+  redpanda-data:
