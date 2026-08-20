@@ -1,0 +1,63 @@
+{
+  "name": "tideline-postgres-source",
+  "config": {
+    "connector.class": "io.debezium.connector.postgresql.PostgresConnector",
+
+    "database.hostname": "postgres",
+    "database.port": "5432",
+    "database.user": "debezium",
+    "database.password": "debezium",
+    "database.dbname": "tideline",
+
+    "//": "Logical server name. Prefixes every topic: <name>.<schema>.<table>.",
+    "topic.prefix": "tideline",
+
+    "//table.include.list": "Explicit allow-list. A new table in the database does not start streaming by accident.",
+    "table.include.list": "shop.customers,shop.orders,shop.order_items,shop.inventory",
+
+    "//plugin.name": "pgoutput is Postgres' built-in logical decoding output plugin — no extension to install, unlike wal2json or decoderbufs.",
+    "plugin.name": "pgoutput",
+    "publication.name": "tideline_pub",
+    "//publication.autocreate.mode": "The publication is created by init SQL, so Debezium must not try to manage it.",
+    "publication.autocreate.mode": "disabled",
+    "slot.name": "tideline_slot",
+
+    "//snapshot.mode": "initial: backfill existing rows as op='r', then stream. 'never' would silently skip everything already in the table.",
+    "snapshot.mode": "initial",
+
+    "//": "Envelope is kept intact. No ExtractNewRecordState transform: the pipeline needs before-images, the LSN, and the snapshot flag, all of which unwrapping discards.",
+
+    "//tombstones.on.delete": "Emit the null-valued tombstone after a delete, so a compacted topic can drop the key. The Spark job filters them.",
+    "tombstones.on.delete": "true",
+
+    "//decimal.handling.mode": "double keeps NUMERIC columns readable as numbers. The default, 'precise', emits base64-encoded bytes that every consumer then has to decode.",
+    "decimal.handling.mode": "double",
+
+    "//time.precision.mode": "connect maps timestamps to standard Connect logical types instead of Debezium's microsecond longs.",
+    "time.precision.mode": "connect",
+
+    "//heartbeat.interval.ms": "Postgres cannot release WAL for a replication slot until the consumer acknowledges an LSN. On a low-traffic table the slot can pin WAL indefinitely and fill the disk. Heartbeats keep the acknowledged position moving.",
+    "heartbeat.interval.ms": "10000",
+
+    "//max.batch.size": "Modest batches suit a laptop; raise on real hardware.",
+    "max.batch.size": "2048",
+    "max.queue.size": "8192",
+    "poll.interval.ms": "500",
+
+    "//topic.creation": "Single-broker stack, so replication factor must be 1.",
+    "topic.creation.enable": "true",
+    "topic.creation.default.replication.factor": "1",
+    "topic.creation.default.partitions": "1",
+    "topic.creation.default.cleanup.policy": "compact",
+    "topic.creation.default.compression.type": "zstd",
+
+    "//errors.tolerance": "Fail loudly. A silently skipped change event is a table that quietly diverges from its source.",
+    "errors.tolerance": "none",
+    "errors.log.enable": "true",
+    "errors.log.include.messages": "true",
+
+    "//schema.history": "Not required for the Postgres connector (unlike MySQL); schema comes from the WAL relation messages, which is what makes mid-stream ALTERs propagate automatically.",
+
+    "provide.transaction.metadata": "false"
+  }
+}
