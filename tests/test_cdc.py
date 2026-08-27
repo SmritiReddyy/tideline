@@ -81,3 +81,57 @@ def test_tombstones_are_dropped(spark, make_batch):
     parsed = build_change_stream(batch).collect()
     assert len(parsed) == 1
     assert parsed[0]["_op"] == "d"
+
+
+# ------------------------------------------------------------ deduplication
+
+
+def test_multiple_changes_to_one_key_collapse_to_the_latest(spark, make_batch):
+    """The failure this prevents: Delta MERGE raises on two source rows per key."""
+    batch = make_batch(
+        [
+            ("1", debezium_event("c", lsn=10, after=_order(1, "new"))),
+            ("1", debezium_event("u", lsn=11, after=_order(1, "paid"))),
+            ("1", debezium_event("u", lsn=12, after=_order(1, "shipped"))),
+        ]
+    )
+    changes = flatten_changes(spark, build_change_stream(batch), ORDERS)
+    deduped = deduplicate_batch(changes, ORDERS).collect()
+
+    assert len(deduped) == 1
+    assert deduped[0]["status"] == "shipped"
+    assert deduped[0]["_lsn"] == 12
+
+
+def test_delete_wins_over_update_at_the_same_lsn(spark, make_batch):
+    """Tie-break must favour the delete; the alternative resurrects the row."""
+    batch = make_batch(
+        [
+            ("1", debezium_event("u", lsn=20, after=_order(1, "paid"))),
+            ("1", debezium_event("d", lsn=20, before=_order(1, "paid"))),
+        ]
+    )
+    changes = flatten_changes(spark, build_change_stream(batch), ORDERS)
+    deduped = deduplicate_batch(changes, ORDERS).collect()
+
+    assert len(deduped) == 1
+    assert deduped[0]["_deleted"] is True
+
+
+def test_composite_primary_key_dedupes_per_key_pair(spark, make_batch):
+    def inv(product_id, warehouse_id, qty):
+        return {"product_id": product_id, "warehouse_id": warehouse_id, "quantity": qty}
+
+    batch = make_batch(
+        [
+            ("a", debezium_event("c", lsn=1, after=inv(1, 1, 10), table="inventory")),
+            ("a", debezium_event("u", lsn=2, after=inv(1, 1, 5), table="inventory")),
+            ("b", debezium_event("c", lsn=3, after=inv(1, 2, 99), table="inventory")),
+        ]
+    )
+    changes = flatten_changes(spark, build_change_stream(batch), INVENTORY)
+    deduped = {
+        (r["product_id"], r["warehouse_id"]): r["quantity"]
+        for r in deduplicate_batch(changes, INVENTORY).collect()
+    }
+    assert deduped == {(1, 1): 5, (1, 2): 99}
