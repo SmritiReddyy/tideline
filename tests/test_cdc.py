@@ -135,3 +135,208 @@ def test_composite_primary_key_dedupes_per_key_pair(spark, make_batch):
         for r in deduplicate_batch(changes, INVENTORY).collect()
     }
     assert deduped == {(1, 1): 5, (1, 2): 99}
+
+
+# ------------------------------------------------------------------- merges
+
+
+def test_insert_update_delete_end_to_end(spark, make_batch, lakehouse):
+    path = f"{lakehouse}/orders"
+
+    process_batch(
+        spark,
+        build_change_stream(
+            make_batch(
+                [
+                    ("1", debezium_event("c", lsn=1, after=_order(1, "new", 100.0))),
+                    ("2", debezium_event("c", lsn=2, after=_order(2, "new", 200.0))),
+                ]
+            )
+        ),
+        ORDERS,
+        path,
+    )
+
+    rows = _rows(spark, path)
+    assert set(rows) == {1, 2}
+    assert rows[1]["status"] == "new"
+
+    # Update order 1, delete order 2.
+    process_batch(
+        spark,
+        build_change_stream(
+            make_batch(
+                [
+                    ("1", debezium_event("u", lsn=3, after=_order(1, "shipped", 100.0))),
+                    ("2", debezium_event("d", lsn=4, before=_order(2, "new", 200.0))),
+                ]
+            )
+        ),
+        ORDERS,
+        path,
+    )
+
+    live = _rows(spark, path)
+    assert set(live) == {1}
+    assert live[1]["status"] == "shipped"
+
+    # Soft delete: the row is still there, flagged.
+    everything = _rows(spark, path, include_deleted=True)
+    assert set(everything) == {1, 2}
+    assert everything[2]["_deleted"] is True
+
+
+def test_hard_delete_removes_the_row(spark, make_batch, lakehouse):
+    path = f"{lakehouse}/orders_hard"
+    process_batch(
+        spark,
+        build_change_stream(
+            make_batch(
+                [
+                    ("1", debezium_event("c", lsn=1, after=_order(1, "new"))),
+                ]
+            )
+        ),
+        ORDERS_HARD,
+        path,
+    )
+
+    process_batch(
+        spark,
+        build_change_stream(
+            make_batch(
+                [
+                    ("1", debezium_event("d", lsn=2, before=_order(1, "new"))),
+                ]
+            )
+        ),
+        ORDERS_HARD,
+        path,
+    )
+
+    assert _read(spark, path).count() == 0
+
+
+def test_out_of_order_event_does_not_overwrite_newer_state(spark, make_batch, lakehouse):
+    """The guard that makes a connector restart or a replay harmless."""
+    path = f"{lakehouse}/orders_ooo"
+
+    process_batch(
+        spark,
+        build_change_stream(
+            make_batch(
+                [
+                    ("1", debezium_event("u", lsn=100, after=_order(1, "shipped"))),
+                ]
+            )
+        ),
+        ORDERS,
+        path,
+    )
+
+    # An older change arrives late.
+    process_batch(
+        spark,
+        build_change_stream(
+            make_batch(
+                [
+                    ("1", debezium_event("u", lsn=50, after=_order(1, "new"))),
+                ]
+            )
+        ),
+        ORDERS,
+        path,
+    )
+
+    rows = _rows(spark, path)
+    assert rows[1]["status"] == "shipped", "stale event overwrote newer state"
+    assert rows[1]["_lsn"] == 100
+
+
+def test_replaying_the_same_batch_is_idempotent(spark, make_batch, lakehouse):
+    """Restarting from an older Kafka offset must not change the table."""
+    path = f"{lakehouse}/orders_replay"
+    events = [
+        ("1", debezium_event("c", lsn=1, after=_order(1, "new"))),
+        ("2", debezium_event("c", lsn=2, after=_order(2, "new"))),
+        ("1", debezium_event("u", lsn=3, after=_order(1, "paid"))),
+    ]
+
+    process_batch(spark, build_change_stream(make_batch(events)), ORDERS, path)
+    first = _rows(spark, path)
+
+    for _ in range(3):
+        process_batch(spark, build_change_stream(make_batch(events)), ORDERS, path)
+
+    assert _rows(spark, path) == first
+    assert _read(spark, path).count() == 2
+
+
+def test_delete_for_unseen_row_is_ignored(spark, make_batch, lakehouse):
+    """Inserting a tombstone for a row we never saw would invent history."""
+    path = f"{lakehouse}/orders_unseen"
+    process_batch(
+        spark,
+        build_change_stream(
+            make_batch(
+                [
+                    ("1", debezium_event("c", lsn=1, after=_order(1, "new"))),
+                ]
+            )
+        ),
+        ORDERS,
+        path,
+    )
+
+    process_batch(
+        spark,
+        build_change_stream(
+            make_batch(
+                [
+                    ("99", debezium_event("d", lsn=2, before=_order(99, "paid"))),
+                ]
+            )
+        ),
+        ORDERS,
+        path,
+    )
+
+    assert set(_rows(spark, path, include_deleted=True)) == {1}
+
+
+def test_snapshot_rows_load_then_live_changes_apply(spark, make_batch, lakehouse):
+    """The connector's initial backfill ('r') then streaming changes."""
+    path = f"{lakehouse}/orders_snapshot"
+    process_batch(
+        spark,
+        build_change_stream(
+            make_batch(
+                [
+                    ("1", debezium_event("r", lsn=1, after=_order(1, "new"), snapshot="true")),
+                    ("2", debezium_event("r", lsn=2, after=_order(2, "paid"), snapshot="last")),
+                ]
+            )
+        ),
+        ORDERS,
+        path,
+    )
+
+    snapshot_rows = _rows(spark, path)
+    assert all(r["_is_snapshot"] for r in snapshot_rows.values())
+
+    process_batch(
+        spark,
+        build_change_stream(
+            make_batch(
+                [
+                    ("1", debezium_event("u", lsn=3, after=_order(1, "shipped"))),
+                ]
+            )
+        ),
+        ORDERS,
+        path,
+    )
+
+    rows = _rows(spark, path)
+    assert rows[1]["status"] == "shipped"
+    assert rows[1]["_is_snapshot"] is False
