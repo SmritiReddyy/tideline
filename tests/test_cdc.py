@@ -423,3 +423,83 @@ def test_evolved_column_updates_existing_row(spark, make_batch, lakehouse):
     rows = _rows(spark, path)
     assert rows[1]["status"] == "paid"
     assert rows[1]["priority"] == "standard"
+
+
+# ------------------------------------------------------------ time travel
+
+
+def test_delta_history_supports_time_travel(spark, make_batch, lakehouse):
+    """Every merge is a version, so 'what did this look like before?' is answerable."""
+    path = f"{lakehouse}/orders_tt"
+    process_batch(
+        spark,
+        build_change_stream(
+            make_batch(
+                [
+                    ("1", debezium_event("c", lsn=1, after=_order(1, "new"))),
+                ]
+            )
+        ),
+        ORDERS,
+        path,
+    )
+    process_batch(
+        spark,
+        build_change_stream(
+            make_batch(
+                [
+                    ("1", debezium_event("u", lsn=2, after=_order(1, "shipped"))),
+                ]
+            )
+        ),
+        ORDERS,
+        path,
+    )
+
+    history = DeltaTable.forPath(spark, path).history()
+    assert history.count() >= 2
+
+    before = spark.read.format("delta").option("versionAsOf", 0).load(path).collect()
+    assert before[0]["status"] == "new"
+
+    after = _read(spark, path).collect()
+    assert after[0]["status"] == "shipped"
+
+
+# ------------------------------------------------------------------- specs
+
+
+def test_table_specs_are_well_formed():
+    for name in ("orders", "order_items", "inventory", "customers"):
+        spec = get_spec(name)
+        assert spec.primary_key, f"{name} has no primary key"
+        assert spec.merge_condition().count("=") == len(spec.primary_key)
+
+
+def test_unknown_table_raises():
+    import pytest
+
+    with pytest.raises(KeyError, match="Unknown table"):
+        get_spec("nope")
+
+
+def test_batch_stats_summarise_throughput(spark, make_batch, lakehouse):
+    path = f"{lakehouse}/orders_stats"
+    summary = process_batch(
+        spark,
+        build_change_stream(
+            make_batch(
+                [
+                    ("1", debezium_event("c", lsn=1, after=_order(1, "new"))),
+                    ("1", debezium_event("u", lsn=2, after=_order(1, "paid"))),
+                    ("2", debezium_event("c", lsn=3, after=_order(2, "new"))),
+                ]
+            )
+        ),
+        ORDERS,
+        path,
+    )
+
+    assert summary["events"] == 3
+    # Three events collapsed to two rows: order 1's two changes became one.
+    assert summary["merged"] == 2
