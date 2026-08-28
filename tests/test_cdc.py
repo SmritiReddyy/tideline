@@ -340,3 +340,86 @@ def test_snapshot_rows_load_then_live_changes_apply(spark, make_batch, lakehouse
     rows = _rows(spark, path)
     assert rows[1]["status"] == "shipped"
     assert rows[1]["_is_snapshot"] is False
+
+
+# -------------------------------------------------------- schema evolution
+
+
+def test_new_column_appears_without_redeploy(spark, make_batch, lakehouse):
+    """The headline schema-evolution case: ALTER TABLE ADD COLUMN mid-stream."""
+    path = f"{lakehouse}/orders_evolve"
+
+    process_batch(
+        spark,
+        build_change_stream(
+            make_batch(
+                [
+                    ("1", debezium_event("c", lsn=1, after=_order(1, "new"))),
+                ]
+            )
+        ),
+        ORDERS,
+        path,
+    )
+    assert "priority" not in _read(spark, path).columns
+
+    # Source table gains a column; later events carry it.
+    evolved = {**_order(2, "new"), "priority": "express"}
+    process_batch(
+        spark,
+        build_change_stream(
+            make_batch(
+                [
+                    ("2", debezium_event("c", lsn=2, after=evolved)),
+                ]
+            )
+        ),
+        ORDERS,
+        path,
+    )
+
+    df = _read(spark, path)
+    assert "priority" in df.columns, "new source column was dropped"
+
+    rows = _rows(spark, path)
+    assert rows[2]["priority"] == "express"
+    # The pre-existing row keeps its history, with the new column null.
+    assert rows[1]["priority"] is None
+
+
+def test_evolved_column_updates_existing_row(spark, make_batch, lakehouse):
+    path = f"{lakehouse}/orders_evolve2"
+    process_batch(
+        spark,
+        build_change_stream(
+            make_batch(
+                [
+                    ("1", debezium_event("c", lsn=1, after=_order(1, "new"))),
+                ]
+            )
+        ),
+        ORDERS,
+        path,
+    )
+
+    process_batch(
+        spark,
+        build_change_stream(
+            make_batch(
+                [
+                    (
+                        "1",
+                        debezium_event(
+                            "u", lsn=2, after={**_order(1, "paid"), "priority": "standard"}
+                        ),
+                    ),
+                ]
+            )
+        ),
+        ORDERS,
+        path,
+    )
+
+    rows = _rows(spark, path)
+    assert rows[1]["status"] == "paid"
+    assert rows[1]["priority"] == "standard"
