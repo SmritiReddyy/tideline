@@ -1,0 +1,142 @@
+name: CI
+
+# The full stack is four containers. CI does not run them — instead it exercises
+# the CDC logic through the offline simulator, which feeds byte-identical
+# Debezium envelopes through the same parse/dedupe/merge path into real Delta
+# tables. That covers everything except Debezium's WAL decoding and Kafka's
+# delivery semantics, in seconds rather than minutes.
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # Spark 3.5 supports Python 3.8-3.11 workers; 3.12+ breaks at runtime.
+  PYTHON_VERSION: "3.11"
+
+jobs:
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+      - run: pip install ruff
+      - run: ruff check src tests scripts
+      - run: ruff format --check src tests scripts
+
+  test:
+    name: CDC correctness
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Spark 3.5 runs on Java 8/11/17. Newer JDKs fail with module access errors.
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+
+      - name: Install
+        run: pip install -e ".[dev]"
+
+      # Delta's jars are resolved through Ivy on first use. Caching them turns a
+      # ~60s download into a few seconds on every subsequent run.
+      - name: Cache Ivy jars
+        uses: actions/cache@v4
+        with:
+          path: ~/.ivy2
+          key: ivy-${{ runner.os }}-${{ hashFiles('pyproject.toml') }}
+
+      - name: Test suite
+        run: pytest -q
+
+      # Proves the whole path end to end, not just the units: snapshot, live
+      # changes, a mid-stream schema change, compaction, and a query.
+      - name: End-to-end simulation
+        run: |
+          tideline simulate --batches 6 --ticks-per-batch 20 --evolve-at-batch 3
+          tideline stats
+          tideline maintain --retain-hours 0
+          tideline stats
+
+      - name: Verify the evolved column reached the lakehouse
+        run: |
+          tideline query --sql "select count(*) as rows_with_tier from customers where loyalty_tier is not null"
+
+      - name: Upload benchmark report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tideline-artifacts-${{ github.run_id }}
+          path: data/benchmark.json
+          retention-days: 14
+          if-no-files-found: ignore
+
+  compose-validate:
+    name: Compose & connector config
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Catches a malformed compose file or an invalid service reference before
+      # anyone waits four minutes for containers to fail.
+      - name: Validate docker-compose
+        run: docker compose -f docker/docker-compose.yml config --quiet
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      - name: Validate connector config
+        run: |
+          python - <<'PY'
+          import json, pathlib
+          raw = json.loads(pathlib.Path("connectors/postgres-source.json").read_text())
+          config = {k: v for k, v in raw["config"].items() if not k.startswith("//")}
+          required = {
+              "connector.class", "database.hostname", "topic.prefix",
+              "plugin.name", "slot.name", "publication.name", "snapshot.mode",
+          }
+          missing = required - set(config)
+          assert not missing, f"connector config missing: {sorted(missing)}"
+          assert "transforms" not in config, "envelope must not be unwrapped"
+          print(f"connector config valid: {len(config)} settings")
+          PY
+
+  dag-validation:
+    name: Airflow DAG import
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      # Airflow and PySpark pin conflicting library versions, so the DAG check
+      # runs in its own job with its own environment rather than fighting the
+      # resolver in the test job.
+      - name: Install Airflow
+        run: |
+          pip install "apache-airflow==2.10.5" \
+            --constraint "https://raw.githubusercontent.com/apache/airflow/constraints-2.10.5/constraints-3.11.txt"
+
+      - name: Import DAGs
+        env:
+          TIDELINE_HOME: ${{ github.workspace }}
+        run: python tests/validate_dags.py
