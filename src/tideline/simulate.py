@@ -216,15 +216,34 @@ class ChangeEventSimulator:
             row["loyalty_tier"] = self.rng.choice(("bronze", "silver", "gold"))
         return {"customers": [self._envelope("customers", "u", dict(row), before)]}
 
-    def evolve(self, column: str = "loyalty_tier") -> None:
+    def evolve(
+        self, column: str = "loyalty_tier", touch_rows: int = 40
+    ) -> dict[str, list[tuple[str, str]]]:
         """Simulate `ALTER TABLE shop.customers ADD COLUMN ...` mid-stream.
 
         From here on, customer events carry the extra field — exactly what
         Debezium emits once the WAL relation message changes.
+
+        The ALTER is then followed by updates to `touch_rows` customers, which
+        is what `generator.evolve_schema` does against the real database. It
+        matters: an ALTER on its own writes nothing to the WAL for existing
+        rows, so with no follow-up traffic the new column never reaches Kafka
+        and never reaches Delta. Relying on the random customer-edit action to
+        fire instead makes the demo a coin flip at small batch counts.
         """
         self.evolved = True
         self.column = column
-        log.info("schema evolved: customers now carry %r", column)
+
+        touched = min(touch_rows, len(self.customers))
+        events = []
+        for customer_id in self.rng.sample(list(self.customers), touched):
+            row = self.customers[customer_id]
+            before = dict(row)
+            row[column] = self.rng.choice(("bronze", "silver", "gold"))
+            events.append(self._envelope("customers", "u", dict(row), before))
+
+        log.info("schema evolved: customers now carry %r (%s rows touched)", column, touched)
+        return {"customers": events}
 
     def tick(self) -> dict[str, list[tuple[str, str]]]:
         action = self.rng.choices(
@@ -291,10 +310,12 @@ def run_simulation(
 
     # Streaming phase.
     for batch_number in range(batches):
-        if evolve_at_batch is not None and batch_number == evolve_at_batch:
-            simulator.evolve()
-
         batch: dict[str, list[tuple[str, str]]] = {}
+
+        if evolve_at_batch is not None and batch_number == evolve_at_batch:
+            for table, events in simulator.evolve().items():
+                batch.setdefault(table, []).extend(events)
+
         for _ in range(ticks_per_batch):
             for table, events in simulator.tick().items():
                 batch.setdefault(table, []).extend(events)

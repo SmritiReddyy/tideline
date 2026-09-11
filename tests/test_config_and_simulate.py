@@ -279,3 +279,29 @@ def test_analytics_sql_has_no_reserved_word_aliases():
     sql = (REPO_ROOT / "query" / "queries" / "analytics.sql").read_text()
     offenders = re.findall(r"\bas (value|rows|lines)\b", sql, flags=re.IGNORECASE)
     assert not offenders, f"reserved words used as aliases: {offenders}"
+
+
+def test_evolve_emits_events_carrying_the_new_column(lakehouse):
+    """An ALTER on its own writes nothing to the WAL for existing rows, so the
+    new column would never reach Kafka. `evolve()` must produce the follow-up
+    updates itself rather than waiting for the 5%-weighted random customer edit
+    to fire — which at small batch counts it may never do."""
+    simulator = ChangeEventSimulator(_config(lakehouse))
+    simulator.snapshot_customers(60)
+
+    events = simulator.evolve(touch_rows=25)
+    customer_events = events["customers"]
+    assert len(customer_events) == 25
+
+    for _key, value in customer_events:
+        payload = json.loads(value)
+        assert payload["op"] == "u"
+        assert payload["after"]["loyalty_tier"] in ("bronze", "silver", "gold")
+        # The before-image must predate the column, or the change is not a change.
+        assert "loyalty_tier" not in payload["before"]
+
+
+def test_evolve_touch_count_is_capped_by_population(lakehouse):
+    simulator = ChangeEventSimulator(_config(lakehouse))
+    simulator.snapshot_customers(5)
+    assert len(simulator.evolve(touch_rows=40)["customers"]) == 5
