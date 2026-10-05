@@ -6,11 +6,20 @@ name: CI
 # tables. That covers everything except Debezium's WAL decoding and Kafka's
 # delivery semantics, in seconds rather than minutes.
 
+# Docs-only changes don't touch anything CI checks, so they don't trigger it.
 on:
   pull_request:
     branches: [main]
+    paths-ignore:
+      - '*.md'
+      - 'docs/**'
+      - 'LICENSE'
   push:
     branches: [main]
+    paths-ignore:
+      - '*.md'
+      - 'docs/**'
+      - 'LICENSE'
   workflow_dispatch:
 
 concurrency:
