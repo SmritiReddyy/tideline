@@ -169,7 +169,7 @@ tideline/
 ├── query/                    Trino catalog + analytical queries
 ├── airflow/dags/             hourly compaction DAG
 ├── scripts/benchmark.py      before/after compaction measurement
-└── tests/                    48 tests
+└── tests/                    50 tests
 ```
 
 ## Troubleshooting

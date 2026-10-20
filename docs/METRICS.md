@@ -101,8 +101,8 @@ cache hit.
 |---|---|---|
 | `test_cdc.py` | 17 | envelope parsing, tombstones, dedup, composite keys, insert/update/delete, hard delete, out-of-order guard, replay idempotency, unseen deletes, snapshot→live, schema evolution, time travel |
 | `test_maintenance.py` | 7 | fragmentation, OPTIMIZE, Z-ORDER, VACUUM, data integrity, history preservation |
-| `test_config_and_simulate.py` | 24 | topic naming, connector config, envelope schema, simulator fidelity, LSN contract, SQL statement splitting |
-| **Total** | **48** | all passing |
+| `test_config_and_simulate.py` | 26 | topic naming, connector config, envelope schema, simulator fidelity, LSN contract, SQL statement splitting |
+| **Total** | **50** | all passing |
 | DAG import validation | 1 DAG, 9 tasks | separate CI job |
 
 Correctness properties asserted rather than assumed:
@@ -221,7 +221,7 @@ identical results, including the mid-stream evolved column.
 
 > Solved the three failure modes that silently corrupt CDC tables — multiple
 > changes per key within a micro-batch, out-of-order delivery, and mid-stream
-> schema changes — and covered each with a regression test, 48 in total.
+> schema changes — and covered each with a regression test, 50 in total.
 
 > Cut Parquet file count 96% (180 → 8) with a scheduled OPTIMIZE / Z-ORDER /
 > VACUUM job, improving analytical query latency 1.59× and reducing on-disk

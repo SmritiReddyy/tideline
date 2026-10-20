@@ -60,7 +60,7 @@ Run against the real stack — Postgres, Debezium, Redpanda, Spark, Delta, Trino
 - Replayed all **2,968 events** back through it: nothing changed
 - Added a column mid-stream: reached Delta in one trigger, **no restart**
 - Compaction took **180 files down to 8**, queries 1.59× faster
-- **48 tests**, all passing
+- **50 tests**, all passing
 
 Full numbers and how they were measured: [docs/METRICS.md](docs/METRICS.md).
 
